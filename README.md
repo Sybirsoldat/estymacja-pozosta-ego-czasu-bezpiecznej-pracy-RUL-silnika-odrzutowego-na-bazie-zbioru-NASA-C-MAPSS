@@ -1,0 +1,1 @@
+# estymacja-pozosta-ego-czasu-bezpiecznej-pracy-RUL-silnika-odrzutowego-na-bazie-zbioru-NASA-C-MAPSS
