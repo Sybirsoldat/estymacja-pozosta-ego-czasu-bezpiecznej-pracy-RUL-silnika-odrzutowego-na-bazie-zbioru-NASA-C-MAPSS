@@ -88,7 +88,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 USE_GPU = torch.cuda.is_available()
-XGB_DEVICE = "cuda" if USE_GPU else "cpu"
+XGB_DEVICE = "cpu"  # XGBoost na CPU — GPU rezerwujemy dla LSTM
 XGB_TREE = "hist"
 
 if USE_GPU:
@@ -312,8 +312,19 @@ def optimize_xgboost_cv(train_df, test_df, xgb_base, sensor_all, op_cols,
 
     feat_cols = [c for c in tr_xgb.columns
                  if c not in ["unit_id", "cycle", "RUL"] + op_cols + sensor_all]
-    tr_xgb[feat_cols] = tr_xgb[feat_cols].replace([np.inf, -np.inf], 0).fillna(0)
-    te_xgb[feat_cols] = te_xgb[feat_cols].replace([np.inf, -np.inf], 0).fillna(0)
+    # Czyść inf/NaN — wydajnie, bez kopiowania całego DataFrame
+    for col in feat_cols:
+        arr = tr_xgb[col].values
+        mask = ~np.isfinite(arr)
+        if mask.any():
+            arr[mask] = 0
+        tr_xgb[col] = arr
+
+        arr = te_xgb[col].values
+        mask = ~np.isfinite(arr)
+        if mask.any():
+            arr[mask] = 0
+        te_xgb[col] = arr
 
     te_last = te_xgb.groupby("unit_id").last().reset_index()
     X_test = te_last[feat_cols].values.astype(np.float32)
@@ -394,7 +405,7 @@ def optimize_xgboost_cv(train_df, test_df, xgb_base, sensor_all, op_cols,
     print(f"    depth={bp['max_depth']}, lr={bp['lr']:.4f}, "
           f"sub={bp['subsample']:.2f}, gamma={bp['gamma']:.2f}")
 
-    return metrics, y_pred, train_time, bp, y_test
+    return metrics, y_pred, train_time, bp, y_test, study
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -449,6 +460,10 @@ def train_lstm_once(X_tr, y_tr, X_val, y_val, n_features,
     best_state = None
     no_improve = 0
 
+    # Batchowana walidacja — unikamy OOM na dużych zbiorach
+    val_loader = DataLoader(TensorDataset(Xv, yv),
+                            batch_size=batch_size, shuffle=False)
+
     for epoch in range(1, epochs + 1):
         model.train()
         for Xb, yb in loader:
@@ -460,8 +475,13 @@ def train_lstm_once(X_tr, y_tr, X_val, y_val, n_features,
         scheduler.step()
 
         model.eval()
+        val_mse_sum, val_count = 0.0, 0
         with torch.no_grad():
-            val_mse = mse_fn(model(Xv), yv).item()
+            for Xb, yb in val_loader:
+                pred = model(Xb)
+                val_mse_sum += mse_fn(pred, yb).item() * len(yb)
+                val_count += len(yb)
+        val_mse = val_mse_sum / val_count
 
         if val_mse < best_val:
             best_val = val_mse
@@ -536,6 +556,9 @@ def optimize_lstm_cv(train_df, test_df, seq_feat, n_features, n_trials=25):
                 epochs=80, patience=12, seed=SEED, trial=trial
             )
             fold_scores.append(val_loss)
+            # Czyść GPU cache między foldami
+            if USE_GPU:
+                torch.cuda.empty_cache()
 
         return np.mean(fold_scores)
 
@@ -546,7 +569,9 @@ def optimize_lstm_cv(train_df, test_df, seq_feat, n_features, n_trials=25):
         sampler=optuna.samplers.TPESampler(seed=SEED),
         pruner=pruner
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    # catch OOM — próba z OOM jest pominięta, nie crashuje skryptu
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False,
+                   catch=(RuntimeError, torch.cuda.OutOfMemoryError))
 
     bp = study.best_params
     best_sl = bp["seq_length"]
@@ -584,13 +609,22 @@ def optimize_lstm_cv(train_df, test_df, seq_feat, n_features, n_trials=25):
             epochs=100, patience=15, seed=seed
         )
         model.eval()
+        # Batchowana predykcja testu
+        te_loader = DataLoader(TensorDataset(torch.FloatTensor(Xte).to(device),
+                               torch.zeros(len(Xte)).to(device)),
+                               batch_size=256, shuffle=False)
+        pred_parts = []
         with torch.no_grad():
-            Xte_t = torch.FloatTensor(Xte).to(device)
-            pred = model(Xte_t).cpu().numpy()
-        pred = np.clip(pred, 0, RUL_CLIP)
+            for Xb, _ in te_loader:
+                pred_parts.append(model(Xb).cpu().numpy())
+        pred = np.clip(np.concatenate(pred_parts), 0, RUL_CLIP)
         preds.append(pred)
         r = rmse(yte, pred)
         print(f"      Model {i + 1}/{len(ENSEMBLE_SEEDS)}: RMSE={r:.2f}")
+        # Zwolnij pamięć GPU
+        del model
+        if USE_GPU:
+            torch.cuda.empty_cache()
 
     train_time = time.time() - t0
 
@@ -605,7 +639,7 @@ def optimize_lstm_cv(train_df, test_df, seq_feat, n_features, n_trials=25):
         n_features, bp["hidden"], bp["n_layers"],
         bp["dense"], bp["dropout"]).parameters())
 
-    return metrics, y_ensemble, train_time, bp, n_params, yte
+    return metrics, y_ensemble, train_time, bp, n_params, yte, study
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -646,6 +680,7 @@ print(f"  Dane:    {data_path}")
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
 all_results = {}
+all_studies = {}  # study objects per dataset per model
 
 for ds_id in DATASETS:
     print(f"\n{'=' * 70}")
@@ -657,27 +692,32 @@ for ds_id in DATASETS:
         preprocess_full(data_path, ds_id)
 
     ds_res = {}
+    ds_studies = {}
 
     # XGBoost
     print(f"\n  [1/2] XGBoost + Optuna + {K_FOLDS}-Fold CV...")
-    m_xgb, p_xgb, t_xgb, bp_xgb, y_test = optimize_xgboost_cv(
+    m_xgb, p_xgb, t_xgb, bp_xgb, y_test, study_xgb = optimize_xgboost_cv(
         train_df, test_df, xgb_base, sensor_all, op_cols, n_trials=XGB_TRIALS)
     ds_res["XGBoost"] = {
         "metrics": m_xgb, "y_pred": p_xgb,
         "time": t_xgb, "best_params": bp_xgb}
     ds_res["y_test"] = y_test
+    ds_studies["XGBoost"] = study_xgb
     print(f"    ★ RMSE={m_xgb['RMSE']:.2f}  NASA={m_xgb['NASA Score']:,.0f}")
 
     # LSTM
     print(f"\n  [2/2] LSTM + Optuna + {K_FOLDS}-Fold CV + Ensemble...")
-    m_lstm, p_lstm, t_lstm, bp_lstm, n_params, y_test_lstm = optimize_lstm_cv(
-        train_df, test_df, seq_feat, len(seq_feat), n_trials=LSTM_TRIALS)
+    m_lstm, p_lstm, t_lstm, bp_lstm, n_params, y_test_lstm, study_lstm = \
+        optimize_lstm_cv(
+            train_df, test_df, seq_feat, len(seq_feat), n_trials=LSTM_TRIALS)
     ds_res["LSTM"] = {
         "metrics": m_lstm, "y_pred": p_lstm,
         "time": t_lstm, "best_params": bp_lstm, "n_params": n_params}
+    ds_studies["LSTM"] = study_lstm
     print(f"    ★ RMSE={m_lstm['RMSE']:.2f}  NASA={m_lstm['NASA Score']:,.0f}")
 
     all_results[ds_id] = ds_res
+    all_studies[ds_id] = ds_studies
 
 with open(os.path.join(RESULTS_DIR, "optuna_v2_results.pkl"), "wb") as f:
     pickle.dump(all_results, f)
@@ -895,6 +935,248 @@ plt.savefig(f"{PLOT_DIR}/52v2_full_table.png", bbox_inches="tight")
 plt.close()
 print(f"  [✓] 52v2_full_table.png")
 
+# ── 53v2: Parallel Coordinates — XGBoost ─────────────────────────────────────
+print(f"\n  Optuna — Parallel Coordinates & Importance...")
+
+for ds_id in DATASETS:
+    study_xgb = all_studies[ds_id]["XGBoost"]
+    study_lstm = all_studies[ds_id]["LSTM"]
+
+    # ── XGBoost Parallel Coordinates ──
+    trials_xgb = [t for t in study_xgb.trials
+                  if t.state == optuna.trial.TrialState.COMPLETE]
+    if len(trials_xgb) < 3:
+        continue
+
+    xgb_params = ["max_depth", "lr", "subsample", "colsample",
+                   "min_child_w", "reg_alpha", "reg_lambda", "gamma"]
+
+    fig, ax = plt.subplots(figsize=(16, 6))
+    # Zbierz dane
+    param_values = {p: [] for p in xgb_params}
+    obj_values = []
+    for t in trials_xgb:
+        obj_values.append(t.value)
+        for p in xgb_params:
+            param_values[p].append(t.params.get(p, 0))
+
+    # Normalizuj do [0, 1] per parametr
+    n_params_plot = len(xgb_params) + 1  # +1 dla objective
+    x_ticks = range(n_params_plot)
+
+    norm_data = []
+    for p in xgb_params:
+        vals = np.array(param_values[p], dtype=float)
+        mn, mx = vals.min(), vals.max()
+        norm_data.append((vals - mn) / (mx - mn + 1e-10))
+    obj_arr = np.array(obj_values)
+    obj_mn, obj_mx = obj_arr.min(), obj_arr.max()
+    norm_obj = (obj_arr - obj_mn) / (obj_mx - obj_mn + 1e-10)
+    norm_data.append(norm_obj)
+
+    # Rysuj linie — koloruj wg objective (ciemniejsze = lepsze)
+    cmap = plt.cm.RdYlGn_r
+    for i in range(len(trials_xgb)):
+        color = cmap(norm_obj[i])
+        alpha = 0.8 if obj_values[i] <= np.percentile(obj_values, 20) else 0.15
+        lw = 2.0 if obj_values[i] <= np.percentile(obj_values, 20) else 0.5
+        line_vals = [nd[i] for nd in norm_data]
+        ax.plot(x_ticks, line_vals, color=color, alpha=alpha, lw=lw)
+
+    ax.set_xticks(x_ticks)
+    ax.set_xticklabels(xgb_params + ["RMSE_CV"], rotation=30, ha="right")
+    ax.set_ylabel("Znormalizowana wartość")
+    ax.set_title(f"Parallel Coordinates — XGBoost {ds_id} "
+                 f"({len(trials_xgb)} prób, zielone = najlepsze)")
+
+    sm = plt.cm.ScalarMappable(cmap=cmap,
+                                norm=plt.Normalize(obj_mn, obj_mx))
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax, label="CV RMSE", shrink=0.8)
+    plt.tight_layout()
+    plt.savefig(f"{PLOT_DIR}/53v2_parallel_xgb_{ds_id}.png",
+                bbox_inches="tight")
+    plt.close()
+
+    # ── LSTM Parallel Coordinates ──
+    trials_lstm = [t for t in study_lstm.trials
+                   if t.state == optuna.trial.TrialState.COMPLETE]
+    if len(trials_lstm) < 3:
+        continue
+
+    lstm_params = ["hidden", "n_layers", "dense", "dropout",
+                    "lr", "batch_size", "seq_length", "use_huber"]
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    param_values = {p: [] for p in lstm_params}
+    obj_values = []
+    for t in trials_lstm:
+        obj_values.append(t.value)
+        for p in lstm_params:
+            val = t.params.get(p, 0)
+            if isinstance(val, bool):
+                val = int(val)
+            param_values[p].append(val)
+
+    n_params_plot = len(lstm_params) + 1
+    x_ticks = range(n_params_plot)
+
+    norm_data = []
+    for p in lstm_params:
+        vals = np.array(param_values[p], dtype=float)
+        mn, mx = vals.min(), vals.max()
+        norm_data.append((vals - mn) / (mx - mn + 1e-10))
+    obj_arr = np.array(obj_values)
+    obj_mn, obj_mx = obj_arr.min(), obj_arr.max()
+    norm_obj = (obj_arr - obj_mn) / (obj_mx - obj_mn + 1e-10)
+    norm_data.append(norm_obj)
+
+    cmap = plt.cm.RdYlGn_r
+    for i in range(len(trials_lstm)):
+        color = cmap(norm_obj[i])
+        alpha = 0.8 if obj_values[i] <= np.percentile(obj_values, 20) else 0.15
+        lw = 2.0 if obj_values[i] <= np.percentile(obj_values, 20) else 0.5
+        line_vals = [nd[i] for nd in norm_data]
+        ax.plot(x_ticks, line_vals, color=color, alpha=alpha, lw=lw)
+
+    ax.set_xticks(x_ticks)
+    ax.set_xticklabels(lstm_params + ["MSE_CV"], rotation=30, ha="right")
+    ax.set_ylabel("Znormalizowana wartość")
+    ax.set_title(f"Parallel Coordinates — LSTM {ds_id} "
+                 f"({len(trials_lstm)} prób)")
+
+    sm = plt.cm.ScalarMappable(cmap=cmap,
+                                norm=plt.Normalize(obj_mn, obj_mx))
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax, label="CV MSE", shrink=0.8)
+    plt.tight_layout()
+    plt.savefig(f"{PLOT_DIR}/53v2_parallel_lstm_{ds_id}.png",
+                bbox_inches="tight")
+    plt.close()
+
+print(f"  [✓] 53v2_parallel_xgb/lstm_FD001–FD004.png")
+
+# ── 54v2: Ważność hiperparametrów (fANOVA-like) ─────────────────────────────
+
+for ds_id in DATASETS:
+    study_xgb = all_studies[ds_id]["XGBoost"]
+    study_lstm = all_studies[ds_id]["LSTM"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    # --- XGBoost importance ---
+    ax = axes[0]
+    trials_xgb = [t for t in study_xgb.trials
+                  if t.state == optuna.trial.TrialState.COMPLETE]
+    if len(trials_xgb) >= 5:
+        # Oblicz importance jako korelację |param vs objective|
+        xgb_params = list(trials_xgb[0].params.keys())
+        importances = {}
+        obj_vals = np.array([t.value for t in trials_xgb])
+        for p in xgb_params:
+            p_vals = np.array([t.params[p] for t in trials_xgb], dtype=float)
+            if p_vals.std() > 1e-10:
+                corr = abs(np.corrcoef(p_vals, obj_vals)[0, 1])
+                importances[p] = corr if not np.isnan(corr) else 0
+            else:
+                importances[p] = 0
+
+        # Sortuj malejąco
+        sorted_imp = sorted(importances.items(), key=lambda x: x[1], reverse=True)
+        names = [x[0] for x in sorted_imp]
+        values = [x[1] for x in sorted_imp]
+
+        bars = ax.barh(range(len(names)), values, color="#E64A19", alpha=0.85)
+        ax.set_yticks(range(len(names)))
+        ax.set_yticklabels(names, fontsize=9)
+        ax.set_xlabel("|Korelacja z RMSE|")
+        ax.set_title(f"XGBoost — ważność hiperparametrów\n{ds_id}")
+        ax.invert_yaxis()
+
+        for bar, val in zip(bars, values):
+            ax.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height() / 2,
+                    f"{val:.3f}", va="center", fontsize=9)
+
+    # --- LSTM importance ---
+    ax = axes[1]
+    trials_lstm = [t for t in study_lstm.trials
+                   if t.state == optuna.trial.TrialState.COMPLETE]
+    if len(trials_lstm) >= 5:
+        # Zbierz parametry obecne we WSZYSTKICH próbach
+        common_params = set(trials_lstm[0].params.keys())
+        for t in trials_lstm:
+            common_params &= set(t.params.keys())
+        lstm_params = sorted(common_params)
+
+        importances = {}
+        obj_vals = np.array([t.value for t in trials_lstm])
+        for p in lstm_params:
+            p_vals = np.array([t.params[p] for t in trials_lstm], dtype=float)
+            if p_vals.std() > 1e-10:
+                corr = abs(np.corrcoef(p_vals, obj_vals)[0, 1])
+                importances[p] = corr if not np.isnan(corr) else 0
+            else:
+                importances[p] = 0
+
+        sorted_imp = sorted(importances.items(), key=lambda x: x[1], reverse=True)
+        names = [x[0] for x in sorted_imp]
+        values = [x[1] for x in sorted_imp]
+
+        bars = ax.barh(range(len(names)), values, color="#2E7D32", alpha=0.85)
+        ax.set_yticks(range(len(names)))
+        ax.set_yticklabels(names, fontsize=9)
+        ax.set_xlabel("|Korelacja z MSE|")
+        ax.set_title(f"LSTM — ważność hiperparametrów\n{ds_id}")
+        ax.invert_yaxis()
+
+        for bar, val in zip(bars, values):
+            ax.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height() / 2,
+                    f"{val:.3f}", va="center", fontsize=9)
+
+    plt.suptitle(f"Ważność hiperparametrów — {ds_id}", fontsize=13,
+                 fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(f"{PLOT_DIR}/54v2_importance_{ds_id}.png", bbox_inches="tight")
+    plt.close()
+
+print(f"  [✓] 54v2_importance_FD001–FD004.png")
+
+# ── 55v2: Optimization History — jak RMSE spada z próbami ────────────────────
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+for idx, ds_id in enumerate(DATASETS):
+    ax = axes[idx // 2][idx % 2]
+
+    for model_name, color in [("XGBoost", "#E64A19"), ("LSTM", "#2E7D32")]:
+        study = all_studies[ds_id][model_name]
+        trials = [t for t in study.trials
+                  if t.state == optuna.trial.TrialState.COMPLETE]
+        vals = [t.value for t in trials]
+        # Running best
+        best_so_far = []
+        current_best = float("inf")
+        for v in vals:
+            current_best = min(current_best, v)
+            best_so_far.append(current_best)
+
+        label_suffix = " (RMSE)" if model_name == "XGBoost" else " (MSE)"
+        ax.plot(range(1, len(vals) + 1), vals, "o", alpha=0.3,
+                color=color, markersize=3)
+        ax.plot(range(1, len(best_so_far) + 1), best_so_far, "-",
+                color=color, lw=2, label=f"{model_name}{label_suffix}")
+
+    ax.set_xlabel("Nr próby Optuna")
+    ax.set_ylabel("Wartość objective (CV)")
+    ax.set_title(f"{ds_id}")
+    ax.legend(fontsize=9)
+
+plt.suptitle("Optimization History — jak objective spada z kolejnymi próbami",
+             fontsize=14, fontweight="bold")
+plt.tight_layout()
+plt.savefig(f"{PLOT_DIR}/55v2_optuna_history.png", bbox_inches="tight")
+plt.close()
+print(f"  [✓] 55v2_optuna_history.png")
+
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║  PODSUMOWANIE                                                            ║
@@ -925,7 +1207,7 @@ for ds in DATASETS:
 total_t = sum(all_results[ds][m]["time"]
               for ds in DATASETS for m in ["XGBoost", "LSTM"])
 print(f"\n  Łączny czas: {total_t:.0f}s ({total_t / 60:.1f} min)")
-print(f"  Wykresy: {PLOT_DIR}/47v2–52v2")
+print(f"  Wykresy: {PLOT_DIR}/47v2–55v2")
 print(f"  Wyniki:  {RESULTS_DIR}/optuna_v2_results.pkl")
 
 print(f"\n  Hiperparametry LSTM:")
